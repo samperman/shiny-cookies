@@ -2,6 +2,105 @@ library(shiny)
 library(bslib)
 library(cookies)
 
+# Build a partitioned cookie string for HTTP Set-Cookie header
+build_partitioned_cookie <- function(name, value, expiration_days = 30, path = "/") {
+  name <- utils::URLencode(name, reserved = TRUE)
+  value <- utils::URLencode(value, reserved = TRUE)
+
+  # Calculate expiration date
+
+  expires <- format(
+    Sys.time() + (expiration_days * 24 * 60 * 60),
+    "%a, %d %b %Y %H:%M:%S GMT",
+    tz = "GMT"
+  )
+
+  # Partitioned cookies require: Secure, SameSite=None, and Partitioned
+  paste0(
+    name, "=", value,
+    "; Expires=", expires,
+    "; Path=", path,
+    "; Secure",
+    "; SameSite=None",
+    "; Partitioned"
+  )
+}
+
+# Set a partitioned cookie via JavaScript (using CookieStore API with fallback)
+set_partitioned_cookie <- function(name, value, expiration_days = 30,
+                                   session = shiny::getDefaultReactiveDomain()) {
+  expires_ms <- expiration_days * 24 * 60 * 60 * 1000
+
+  # Use CookieStore API which supports partitioned, with fallback to document.cookie
+  js_code <- sprintf(
+    "
+    (async function() {
+      const name = %s;
+      const value = %s;
+      const expiresMs = %d;
+      const expires = new Date(Date.now() + expiresMs);
+
+      if ('cookieStore' in window) {
+        try {
+          await cookieStore.set({
+            name: name,
+            value: value,
+            expires: expires,
+            path: '/',
+            sameSite: 'none',
+            secure: true,
+            partitioned: true
+          });
+          return;
+        } catch(e) {
+          console.warn('CookieStore API failed, falling back:', e);
+        }
+      }
+
+      // Fallback: document.cookie (Partitioned may not work in all browsers)
+      document.cookie = name + '=' + encodeURIComponent(value) +
+        '; expires=' + expires.toUTCString() +
+        '; path=/; Secure; SameSite=None; Partitioned';
+    })();
+    ",
+    jsonlite::toJSON(name, auto_unbox = TRUE),
+    jsonlite::toJSON(value, auto_unbox = TRUE),
+    expires_ms
+  )
+
+  session$sendCustomMessage("shiny-run-js", js_code)
+}
+
+# Remove a partitioned cookie
+remove_partitioned_cookie <- function(name, session = shiny::getDefaultReactiveDomain()) {
+  js_code <- sprintf(
+    "
+    (async function() {
+      const name = %s;
+
+      if ('cookieStore' in window) {
+        try {
+          await cookieStore.delete({
+            name: name,
+            path: '/',
+            partitioned: true
+          });
+          return;
+        } catch(e) {
+          console.warn('CookieStore delete failed, falling back:', e);
+        }
+      }
+
+      // Fallback: expire the cookie
+      document.cookie = name + '=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/; Secure; SameSite=None; Partitioned';
+    })();
+    ",
+    jsonlite::toJSON(name, auto_unbox = TRUE)
+  )
+
+  session$sendCustomMessage("shiny-run-js", js_code)
+}
+
 # Safe cookie helpers that won't crash if cookies fail
 safe_get_cookie <- function(name) {
   tryCatch(
@@ -12,7 +111,7 @@ safe_get_cookie <- function(name) {
 
 safe_set_cookie <- function(name, value, expiration = 30) {
   tryCatch({
-    set_cookie(name, value, expiration = expiration)
+    set_partitioned_cookie(name, value, expiration_days = expiration)
     TRUE
   }, error = function(e) {
     FALSE
@@ -21,7 +120,7 @@ safe_set_cookie <- function(name, value, expiration = 30) {
 
 safe_remove_cookie <- function(name) {
   tryCatch({
-    remove_cookie(name)
+    remove_partitioned_cookie(name)
     TRUE
   }, error = function(e) {
     FALSE
@@ -70,18 +169,29 @@ ui <- page_sidebar(
     card_body(
       p("This app demonstrates browser cookies in Shiny:"),
       tags$ul(
-        tags$li(tags$strong("Persistence:"), " Your preferences survive browser refreshes and closing/reopening the browser.
-"),
+        tags$li(tags$strong("Partitioned:"), " Cookies are set with the Partitioned attribute (CHIPS) for privacy."),
+        tags$li(tags$strong("Persistence:"), " Your preferences survive browser refreshes and closing/reopening the browser."),
         tags$li(tags$strong("Visit Counter:"), " Each time you load the app, the visit count increments."),
         tags$li(tags$strong("Expiration:"), " These cookies expire after 30 days.")
       ),
-      p("Try refreshing the page or closing and reopening your browser to see cookies in action!")
+      p("Try refreshing the page or closing and reopening your browser to see cookies in action!"),
+      p(class = "text-muted small", "Note: Partitioned cookies require HTTPS and a modern browser (Chrome 114+, Edge 114+, Firefox 131+).")
     )
   )
 )
 
-# Wrap UI with cookies
-ui <- add_cookie_handlers(ui)
+# Wrap UI with cookies and add JS handler for partitioned cookie support
+ui <- add_cookie_handlers(
+  tagList(
+    ui,
+    tags$script(HTML("
+      // Handler for running JavaScript from Shiny server
+      Shiny.addCustomMessageHandler('shiny-run-js', function(code) {
+        eval(code);
+      });
+    "))
+  )
+)
 
 server <- function(input, output, session) {
   # Reactive values to track cookie state
