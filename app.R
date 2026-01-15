@@ -109,18 +109,19 @@ safe_get_cookie <- function(name) {
   )
 }
 
-safe_set_cookie <- function(name, value, expiration = 30) {
+safe_set_cookie <- function(name, value, expiration = 30,
+                           session = shiny::getDefaultReactiveDomain()) {
   tryCatch({
-    set_partitioned_cookie(name, value, expiration_days = expiration)
+    set_partitioned_cookie(name, value, expiration_days = expiration, session = session)
     TRUE
   }, error = function(e) {
     FALSE
   })
 }
 
-safe_remove_cookie <- function(name) {
+safe_remove_cookie <- function(name, session = shiny::getDefaultReactiveDomain()) {
   tryCatch({
-    remove_partitioned_cookie(name)
+    remove_partitioned_cookie(name, session = session)
     TRUE
   }, error = function(e) {
     FALSE
@@ -185,42 +186,40 @@ ui <- add_cookie_handlers(
   tagList(
     ui,
     tags$script(HTML("
-      // Handler for running JavaScript from Shiny server
-      Shiny.addCustomMessageHandler('shiny-run-js', function(code) {
-        eval(code);
+      // Handler for running JavaScript from Shiny server (partitioned cookies)
+      $(document).on('shiny:connected', function() {
+        Shiny.addCustomMessageHandler('shiny-run-js', function(code) {
+          try {
+            eval(code);
+          } catch(e) {
+            console.error('Error executing cookie JS:', e);
+          }
+        });
+        // Signal that the handler is ready
+        Shiny.setInputValue('js_handler_ready', true, {priority: 'event'});
       });
     "))
   )
 )
 
 server <- function(input, output, session) {
-  # Reactive values to track cookie state
+  # Reactive value to track cookie loading state
   cookies_loaded <- reactiveVal(FALSE)
-  cookies_available <- reactiveVal(TRUE)
 
-  # Load cookies on startup
+  # Load cookies on startup - wait for JS handler to be ready
   observe({
+    req(input$js_handler_ready)
+
     # Get existing cookies
     saved_name <- safe_get_cookie("user_name")
     saved_color <- safe_get_cookie("accent_color")
     visit_count <- safe_get_cookie("visit_count")
-    
-    # Update visit count - also tests if cookies are working
+
+    # Update visit count
     new_count <- if (is.null(visit_count)) 1 else as.integer(visit_count) + 1
-    cookie_success <- safe_set_cookie("visit_count", as.character(new_count), expiration = 30)
-    safe_set_cookie("last_visit", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), expiration = 30)
-    
-    # Track if cookies are available
-    cookies_available(cookie_success)
-    
-    if (!cookie_success) {
-      showNotification(
-        "Cookies are not available. Your preferences won't be saved between sessions.",
-        type = "warning",
-        duration = 10
-      )
-    }
-    
+    safe_set_cookie("visit_count", as.character(new_count), expiration = 30, session = session)
+    safe_set_cookie("last_visit", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), expiration = 30, session = session)
+
     # Restore saved preferences to inputs
     if (!is.null(saved_name) && saved_name != "") {
       updateTextInput(session, "user_name", value = saved_name)
@@ -228,36 +227,29 @@ server <- function(input, output, session) {
     if (!is.null(saved_color)) {
       updateSelectInput(session, "accent_color", selected = saved_color)
     }
-    
+
     cookies_loaded(TRUE)
-  }) |> bindEvent(TRUE, once = TRUE)
+  }) |> bindEvent(input$js_handler_ready, once = TRUE)
   
   # Save preferences when button clicked
   observe({
-    success <- all(
-      safe_set_cookie("user_name", input$user_name, expiration = 30),
-      safe_set_cookie("accent_color", input$accent_color, expiration = 30),
-      safe_set_cookie("prefs_saved_at", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), expiration = 30)
-    )
-    
-    if (success) {
-      showNotification("Preferences saved to cookies!", type = "message")
-    } else {
-      showNotification("Could not save preferences. Cookies may be disabled.", type = "error")
-    }
+    safe_set_cookie("user_name", input$user_name, expiration = 30, session = session)
+    safe_set_cookie("accent_color", input$accent_color, expiration = 30, session = session)
+    safe_set_cookie("prefs_saved_at", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), expiration = 30, session = session)
+    showNotification("Preferences saved to cookies!", type = "message")
   }) |> bindEvent(input$save_prefs)
   
   # Clear all cookies
   observe({
-    safe_remove_cookie("user_name")
-    safe_remove_cookie("accent_color")
-    safe_remove_cookie("visit_count")
-    safe_remove_cookie("last_visit")
-    safe_remove_cookie("prefs_saved_at")
-    
+    safe_remove_cookie("user_name", session = session)
+    safe_remove_cookie("accent_color", session = session)
+    safe_remove_cookie("visit_count", session = session)
+    safe_remove_cookie("last_visit", session = session)
+    safe_remove_cookie("prefs_saved_at", session = session)
+
     updateTextInput(session, "user_name", value = "")
     updateSelectInput(session, "accent_color", selected = "#0d6efd")
-    
+
     showNotification("All cookies cleared! Refresh to start fresh.", type = "warning")
   }) |> bindEvent(input$clear_cookies)
   
@@ -266,24 +258,12 @@ server <- function(input, output, session) {
     # Re-read cookies to show current state
     input$save_prefs
     input$clear_cookies
-    
+
     visit_count <- safe_get_cookie("visit_count")
     last_visit <- safe_get_cookie("last_visit")
     prefs_saved <- safe_get_cookie("prefs_saved_at")
-    
-    # Show warning if cookies aren't working
-    cookie_warning <- if (!cookies_available()) {
-      tags$div(
-        class = "alert alert-warning",
-        tags$strong("⚠️ Cookies unavailable: "),
-        "Preferences will only persist during this session."
-      )
-    } else {
-      NULL
-    }
-    
+
     tags$div(
-      cookie_warning,
       tags$p(
         tags$strong("Visit Count: "),
         tags$span(
