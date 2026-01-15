@@ -2,105 +2,6 @@ library(shiny)
 library(bslib)
 library(cookies)
 
-# Build a partitioned cookie string for HTTP Set-Cookie header
-build_partitioned_cookie <- function(name, value, expiration_days = 30, path = "/") {
-  name <- utils::URLencode(name, reserved = TRUE)
-  value <- utils::URLencode(value, reserved = TRUE)
-
-  # Calculate expiration date
-
-  expires <- format(
-    Sys.time() + (expiration_days * 24 * 60 * 60),
-    "%a, %d %b %Y %H:%M:%S GMT",
-    tz = "GMT"
-  )
-
-  # Partitioned cookies require: Secure, SameSite=None, and Partitioned
-  paste0(
-    name, "=", value,
-    "; Expires=", expires,
-    "; Path=", path,
-    "; Secure",
-    "; SameSite=None",
-    "; Partitioned"
-  )
-}
-
-# Set a partitioned cookie via JavaScript (using CookieStore API with fallback)
-set_partitioned_cookie <- function(name, value, expiration_days = 30,
-                                   session = shiny::getDefaultReactiveDomain()) {
-  expires_ms <- expiration_days * 24 * 60 * 60 * 1000
-
-  # Use CookieStore API which supports partitioned, with fallback to document.cookie
-  js_code <- sprintf(
-    "
-    (async function() {
-      const name = %s;
-      const value = %s;
-      const expiresMs = %d;
-      const expires = new Date(Date.now() + expiresMs);
-
-      if ('cookieStore' in window) {
-        try {
-          await cookieStore.set({
-            name: name,
-            value: value,
-            expires: expires,
-            path: '/',
-            sameSite: 'none',
-            secure: true,
-            partitioned: true
-          });
-          return;
-        } catch(e) {
-          console.warn('CookieStore API failed, falling back:', e);
-        }
-      }
-
-      // Fallback: document.cookie (Partitioned may not work in all browsers)
-      document.cookie = name + '=' + encodeURIComponent(value) +
-        '; expires=' + expires.toUTCString() +
-        '; path=/; Secure; SameSite=None; Partitioned';
-    })();
-    ",
-    jsonlite::toJSON(name, auto_unbox = TRUE),
-    jsonlite::toJSON(value, auto_unbox = TRUE),
-    expires_ms
-  )
-
-  session$sendCustomMessage("shiny-run-js", js_code)
-}
-
-# Remove a partitioned cookie
-remove_partitioned_cookie <- function(name, session = shiny::getDefaultReactiveDomain()) {
-  js_code <- sprintf(
-    "
-    (async function() {
-      const name = %s;
-
-      if ('cookieStore' in window) {
-        try {
-          await cookieStore.delete({
-            name: name,
-            path: '/',
-            partitioned: true
-          });
-          return;
-        } catch(e) {
-          console.warn('CookieStore delete failed, falling back:', e);
-        }
-      }
-
-      // Fallback: expire the cookie
-      document.cookie = name + '=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/; Secure; SameSite=None; Partitioned';
-    })();
-    ",
-    jsonlite::toJSON(name, auto_unbox = TRUE)
-  )
-
-  session$sendCustomMessage("shiny-run-js", js_code)
-}
-
 # Safe cookie helpers that won't crash if cookies fail
 safe_get_cookie <- function(name) {
   tryCatch(
@@ -109,19 +10,20 @@ safe_get_cookie <- function(name) {
   )
 }
 
-safe_set_cookie <- function(name, value, expiration = 30,
-                           session = shiny::getDefaultReactiveDomain()) {
+safe_set_cookie <- function(name, value, expiration = 30) {
   tryCatch({
-    set_partitioned_cookie(name, value, expiration_days = expiration, session = session)
+    # Use cookies package with SameSite=None (required for Partitioned)
+    # The Partitioned attribute is added via JavaScript patching below
+    set_cookie(name, value, expiration = expiration, secure_only = TRUE, same_site = "None")
     TRUE
   }, error = function(e) {
     FALSE
   })
 }
 
-safe_remove_cookie <- function(name, session = shiny::getDefaultReactiveDomain()) {
+safe_remove_cookie <- function(name) {
   tryCatch({
-    remove_partitioned_cookie(name, session = session)
+    remove_cookie(name)
     TRUE
   }, error = function(e) {
     FALSE
@@ -181,44 +83,68 @@ ui <- page_sidebar(
   )
 )
 
-# Wrap UI with cookies and add JS handler for partitioned cookie support
+# Wrap UI with cookies and add JS to make all cookies partitioned
 ui <- add_cookie_handlers(
   tagList(
     ui,
+    # Patch js-cookie to add Partitioned attribute to all cookies
     tags$script(HTML("
-      // Handler for running JavaScript from Shiny server (partitioned cookies)
-      $(document).on('shiny:connected', function() {
-        Shiny.addCustomMessageHandler('shiny-run-js', function(code) {
-          try {
-            eval(code);
-          } catch(e) {
-            console.error('Error executing cookie JS:', e);
-          }
-        });
-        // Signal that the handler is ready
-        Shiny.setInputValue('js_handler_ready', true, {priority: 'event'});
+      $(document).ready(function() {
+        // Override document.cookie setter to add Partitioned attribute
+        var cookieDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie') ||
+                         Object.getOwnPropertyDescriptor(HTMLDocument.prototype, 'cookie');
+
+        if (cookieDesc && cookieDesc.set) {
+          var originalSetter = cookieDesc.set;
+
+          Object.defineProperty(document, 'cookie', {
+            get: function() {
+              return cookieDesc.get.call(document);
+            },
+            set: function(val) {
+              // Add Partitioned if cookie has Secure and SameSite=None but no Partitioned
+              if (val.indexOf('Secure') !== -1 &&
+                  val.toLowerCase().indexOf('samesite=none') !== -1 &&
+                  val.indexOf('Partitioned') === -1) {
+                val = val + '; Partitioned';
+              }
+              return originalSetter.call(document, val);
+            },
+            configurable: true
+          });
+        }
       });
     "))
   )
 )
 
 server <- function(input, output, session) {
-  # Reactive value to track cookie loading state
+  # Reactive values to track cookie state
   cookies_loaded <- reactiveVal(FALSE)
+  cookies_available <- reactiveVal(TRUE)
 
-  # Load cookies on startup - wait for JS handler to be ready
+  # Load cookies on startup
   observe({
-    req(input$js_handler_ready)
-
     # Get existing cookies
     saved_name <- safe_get_cookie("user_name")
     saved_color <- safe_get_cookie("accent_color")
     visit_count <- safe_get_cookie("visit_count")
 
-    # Update visit count
+    # Update visit count - also tests if cookies are working
     new_count <- if (is.null(visit_count)) 1 else as.integer(visit_count) + 1
-    safe_set_cookie("visit_count", as.character(new_count), expiration = 30, session = session)
-    safe_set_cookie("last_visit", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), expiration = 30, session = session)
+    cookie_success <- safe_set_cookie("visit_count", as.character(new_count), expiration = 30)
+    safe_set_cookie("last_visit", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), expiration = 30)
+
+    # Track if cookies are available
+    cookies_available(cookie_success)
+
+    if (!cookie_success) {
+      showNotification(
+        "Cookies are not available. Your preferences won't be saved between sessions.",
+        type = "warning",
+        duration = 10
+      )
+    }
 
     # Restore saved preferences to inputs
     if (!is.null(saved_name) && saved_name != "") {
@@ -229,30 +155,37 @@ server <- function(input, output, session) {
     }
 
     cookies_loaded(TRUE)
-  }) |> bindEvent(input$js_handler_ready, once = TRUE)
-  
+  }) |> bindEvent(TRUE, once = TRUE)
+
   # Save preferences when button clicked
   observe({
-    safe_set_cookie("user_name", input$user_name, expiration = 30, session = session)
-    safe_set_cookie("accent_color", input$accent_color, expiration = 30, session = session)
-    safe_set_cookie("prefs_saved_at", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), expiration = 30, session = session)
-    showNotification("Preferences saved to cookies!", type = "message")
+    success <- all(
+      safe_set_cookie("user_name", input$user_name, expiration = 30),
+      safe_set_cookie("accent_color", input$accent_color, expiration = 30),
+      safe_set_cookie("prefs_saved_at", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), expiration = 30)
+    )
+
+    if (success) {
+      showNotification("Preferences saved to cookies!", type = "message")
+    } else {
+      showNotification("Could not save preferences. Cookies may be disabled.", type = "error")
+    }
   }) |> bindEvent(input$save_prefs)
-  
+
   # Clear all cookies
   observe({
-    safe_remove_cookie("user_name", session = session)
-    safe_remove_cookie("accent_color", session = session)
-    safe_remove_cookie("visit_count", session = session)
-    safe_remove_cookie("last_visit", session = session)
-    safe_remove_cookie("prefs_saved_at", session = session)
+    safe_remove_cookie("user_name")
+    safe_remove_cookie("accent_color")
+    safe_remove_cookie("visit_count")
+    safe_remove_cookie("last_visit")
+    safe_remove_cookie("prefs_saved_at")
 
     updateTextInput(session, "user_name", value = "")
     updateSelectInput(session, "accent_color", selected = "#0d6efd")
 
     showNotification("All cookies cleared! Refresh to start fresh.", type = "warning")
   }) |> bindEvent(input$clear_cookies)
-  
+
   # Display cookie status
   output$cookie_status <- renderUI({
     # Re-read cookies to show current state
@@ -263,7 +196,19 @@ server <- function(input, output, session) {
     last_visit <- safe_get_cookie("last_visit")
     prefs_saved <- safe_get_cookie("prefs_saved_at")
 
+    # Show warning if cookies aren't working
+    cookie_warning <- if (!cookies_available()) {
+      tags$div(
+        class = "alert alert-warning",
+        tags$strong("Cookies unavailable: "),
+        "Preferences will only persist during this session."
+      )
+    } else {
+      NULL
+    }
+
     tags$div(
+      cookie_warning,
       tags$p(
         tags$strong("Visit Count: "),
         tags$span(
@@ -285,32 +230,30 @@ server <- function(input, output, session) {
       )
     )
   })
-  
+
   # Personalized greeting
   output$greeting <- renderUI({
     req(cookies_loaded())
-    
+
     name <- if (is.null(input$user_name) || input$user_name == "") {
       "Visitor"
     } else {
       input$user_name
     }
-    
+
     visit_count <- safe_get_cookie("visit_count")
     visits <- if (is.null(visit_count)) 1 else as.integer(visit_count)
-    
-    visit_message <- if (visits == 1) {
 
+    visit_message <- if (visits == 1) {
       "Welcome to your first visit!"
     } else if (visits < 5) {
       paste0("Nice to see you again! This is visit #", visits, ".")
     } else if (visits < 10) {
       paste0("You're becoming a regular! Visit #", visits, ".")
     } else {
-      paste0("Wow, visit #", visits, "! You must really like cookies! 🍪
-")
+      paste0("Wow, visit #", visits, "! You must really like cookies!")
     }
-    
+
     tags$div(
       tags$h3(
         style = paste0("color: ", input$accent_color, ";"),
@@ -319,7 +262,7 @@ server <- function(input, output, session) {
       tags$p(class = "lead", visit_message)
     )
   })
-  
+
   # Color badge showing current selection
   output$color_badge <- renderUI({
     tags$span(
