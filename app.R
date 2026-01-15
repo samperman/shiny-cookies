@@ -12,9 +12,8 @@ safe_get_cookie <- function(name) {
 
 safe_set_cookie <- function(name, value, expiration = 30) {
   tryCatch({
-    # Use cookies package with SameSite=None (required for Partitioned)
-    # The Partitioned attribute is added via JavaScript patching below
-    set_cookie(name, value, expiration = expiration, secure_only = TRUE, same_site = "None")
+    # Use cookies package - JS patch below adds Secure, SameSite=None, and Partitioned
+    set_cookie(name, value, expiration = expiration)
     TRUE
   }, error = function(e) {
     FALSE
@@ -87,10 +86,10 @@ ui <- page_sidebar(
 ui <- add_cookie_handlers(
   tagList(
     ui,
-    # Patch js-cookie to add Partitioned attribute to all cookies
+    # Patch document.cookie to make all cookies partitioned
     tags$script(HTML("
       $(document).ready(function() {
-        // Override document.cookie setter to add Partitioned attribute
+        // Override document.cookie setter to add Partitioned attributes
         var cookieDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie') ||
                          Object.getOwnPropertyDescriptor(HTMLDocument.prototype, 'cookie');
 
@@ -102,10 +101,24 @@ ui <- add_cookie_handlers(
               return cookieDesc.get.call(document);
             },
             set: function(val) {
-              // Add Partitioned if cookie has Secure and SameSite=None but no Partitioned
-              if (val.indexOf('Secure') !== -1 &&
-                  val.toLowerCase().indexOf('samesite=none') !== -1 &&
-                  val.indexOf('Partitioned') === -1) {
+              // Don't modify deletion cookies (ones with expires in the past or max-age=0)
+              if (val.indexOf('expires=Thu, 01 Jan 1970') !== -1 ||
+                  val.indexOf('max-age=0') !== -1) {
+                // For deletion, also need the partitioned flag
+                if (val.indexOf('Partitioned') === -1) {
+                  val = val + '; Secure; SameSite=None; Partitioned';
+                }
+                return originalSetter.call(document, val);
+              }
+
+              // Add partitioned cookie attributes if not present
+              if (val.indexOf('Secure') === -1) {
+                val = val + '; Secure';
+              }
+              if (val.toLowerCase().indexOf('samesite=') === -1) {
+                val = val + '; SameSite=None';
+              }
+              if (val.indexOf('Partitioned') === -1) {
                 val = val + '; Partitioned';
               }
               return originalSetter.call(document, val);
